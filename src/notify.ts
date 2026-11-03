@@ -20,47 +20,30 @@ interface SmtpResponse {
   message: string;
 }
 
-function parseSmtpResponse(data: string): SmtpResponse[] {
-  const lines = data.split('\r\n').filter((l) => l.length);
-  const out: SmtpResponse[] = [];
-  for (const line of lines) {
-    const code = parseInt(line.slice(0, 3), 10);
-    out.push({ code, message: line });
+/** UTF-8 → base64（分块调用 fromCharCode，避免长正文爆栈） */
+function utf8ToBase64(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...Array.from(bytes.subarray(i, i + CHUNK)));
   }
-  return out;
+  return btoa(bin);
 }
 
-async function smtpTalk(socket: any, send: string, expectedCodes: number[]): Promise<SmtpResponse[]> {
-  const writer = socket.writable.getWriter();
-  await writer.write(new TextEncoder().encode(send));
-  writer.releaseLock();
-
-  const reader = socket.readable.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) throw new Error('SMTP 连接被关闭');
-    buf += decoder.decode(value, { stream: true });
-    // 响应以 CRLF.CRLF 或带空格续行的结束；简化：等最后一行以 \r\n 结尾且为 3 位码+空格
-    const lines = buf.split('\r\n');
-    if (lines.length >= 2 && lines[lines.length - 2].length > 0) {
-      const last = lines[lines.length - 2];
-      if (/^\d{3} /.test(last)) {
-        reader.releaseLock();
-        const responses = parseSmtpResponse(buf);
-        const lastCode = responses[responses.length - 1].code;
-        if (!expectedCodes.includes(lastCode)) {
-          throw new Error(`SMTP 错误: ${last}`);
-        }
-        return responses;
-      }
-    }
-  }
+/** base64 按 76 字符折行 —— RFC 5321 规定单行不得超过 998 字符，长 HTML 正文必须折行 */
+function foldBase64(s: string, width = 76): string {
+  const raw = utf8ToBase64(s);
+  const lines: string[] = [];
+  for (let i = 0; i < raw.length; i += width) lines.push(raw.slice(i, i + width));
+  return lines.join('\r\n');
 }
 
-function base64(s: string): string {
-  return btoa(unescape(encodeURIComponent(s)));
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} 超时 (${ms}ms)`)), ms)),
+  ]);
 }
 
 export async function sendMail(
@@ -73,63 +56,85 @@ export async function sendMail(
   const port = parseInt(cfg['notify_port'] || '465', 10);
   const username = cfg['notify_username'] || '';
   const password = cfg['notify_password'] || '';
-  const secure = cfg['notify_secure'] || 'ssl'; // ssl | tls | '' 
+  const secure = cfg['notify_secure'] || 'ssl'; // ssl | tls | ''
 
   if (!host || !username || !password || !to) return 'SMTP 配置不完整';
 
+  let socket: any = null;
   try {
-    // connect() 仅在 socket 允许时可用（本地 dev 用 connect 兼容层）
     const { connect } = await import('cloudflare:sockets');
-    const tls = secure === 'ssl' || port === 465;
+    const useImplicitTls = secure === 'ssl' || port === 465;
+    const useStartTls = !useImplicitTls && (secure === 'tls' || port === 587);
 
-    const socket = connect(
-      { hostname: host, port },
-      (tls ? { secureTransport: 'on' } : undefined) as any,
-    );
-    const reader = socket.readable.getReader();
+    // Workers 的 connect() 通过 secureTransport 声明加密方式：
+    //   'on'       → 立即 TLS（465 / SMTPS）
+    //   'starttls' → 明文连接，运行时会在我方发出 STARTTLS 并收到 220 后自动升级为 TLS
+    // 注意：Socket 上没有 startTls() 方法，旧代码的 socket.startTls?.() 是空操作，587 端口实际发不出去。
+    const options = useImplicitTls
+      ? ({ secureTransport: 'on' } as any)
+      : useStartTls
+        ? ({ secureTransport: 'starttls' } as any)
+        : undefined;
+
+    socket = connect({ hostname: host, port }, options);
+
     const decoder = new TextDecoder();
     let buf = '';
+
     const readResponse = async (): Promise<SmtpResponse[]> => {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) throw new Error('SMTP 连接被关闭');
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split('\r\n');
-        if (lines.length >= 2 && /^\d{3} /.test(lines[lines.length - 2] || '')) {
-          const responses = parseSmtpResponse(buf);
-          buf = '';
-          reader.releaseLock();
-          return responses;
+      const reader = socket.readable.getReader();
+      try {
+        while (true) {
+          const chunk: any = await withTimeout<any>(reader.read(), 20000, 'SMTP 读取响应');
+          const { value, done } = chunk;
+          if (done) throw new Error('SMTP 连接被关闭');
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\r\n');
+          // 多行响应（250-xxx）以 "三位码 + 空格" 结尾
+          if (lines.length >= 2 && /^\d{3} /.test(lines[lines.length - 2] || '')) {
+            const text = buf;
+            buf = '';
+            return text
+              .split('\r\n')
+              .filter((l) => l.length)
+              .map((l) => ({ code: parseInt(l.slice(0, 3), 10), message: l }));
+          }
         }
+      } finally {
+        reader.releaseLock();
       }
     };
+
     const talk = async (send: string, expected: number[]): Promise<SmtpResponse[]> => {
-      const w = socket.writable.getWriter();
-      await w.write(new TextEncoder().encode(send));
-      w.releaseLock();
+      const writer = socket.writable.getWriter();
+      try {
+        await withTimeout(writer.write(new TextEncoder().encode(send)), 20000, 'SMTP 写入');
+      } finally {
+        writer.releaseLock();
+      }
       const responses = await readResponse();
-      const code = responses[responses.length - 1].code;
-      if (!expected.includes(code)) throw new Error(`SMTP 错误: ${responses[responses.length - 1].message}`);
+      const last = responses[responses.length - 1];
+      if (!expected.includes(last.code)) throw new Error(`SMTP 错误: ${last.message}`);
       return responses;
     };
 
     // 220 欢迎
-    let resp = await readResponse();
-    if (resp[0].code !== 220) throw new Error(`SMTP 连接失败: ${resp[0].message}`);
+    const greet = await readResponse();
+    if (greet[0].code !== 220) throw new Error(`SMTP 连接失败: ${greet[0].message}`);
 
-    const ehlo = `EHLO cdt-monitor\r\n`;
-    resp = await talk(ehlo, [250]);
+    const ehlo = 'EHLO cdt-monitor\r\n';
+    let resp = await talk(ehlo, [250]);
 
-    // STARTTLS
-    if (!tls && (secure === 'tls' || port === 587)) {
-      resp = await talk('STARTTLS\r\n', [220]);
-      await socket.startTls?.();
+    // STARTTLS：发命令 → 收 220 → 由运行时自动完成 TLS 升级 → 重新 EHLO
+    if (useStartTls) {
+      await talk('STARTTLS\r\n', [220]);
       resp = await talk(ehlo, [250]);
     }
+    void resp;
 
     await talk('AUTH LOGIN\r\n', [334]);
-    await talk(`${base64(username)}\r\n`, [334]);
-    await talk(`${base64(password)}\r\n`, [235]);
+    await talk(`${utf8ToBase64(username)}\r\n`, [334]);
+    await talk(`${utf8ToBase64(password)}\r\n`, [235]);
 
     await talk(`MAIL FROM:<${username}>\r\n`, [250]);
     await talk(`RCPT TO:<${to}>\r\n`, [250, 251]);
@@ -138,19 +143,23 @@ export async function sendMail(
     const headers = [
       `From: 阿里云CDT监控 <${username}>`,
       `To: <${to}>`,
-      `Subject: =?UTF-8?B?${btoa(unescape(encodeURIComponent(subject)))}?=`,
+      `Subject: =?UTF-8?B?${utf8ToBase64(subject)}?=`,
       'MIME-Version: 1.0',
       'Content-Type: text/html; charset=UTF-8',
       'Content-Transfer-Encoding: base64',
+      `Date: ${new Date().toUTCString()}`,
       '',
     ].join('\r\n');
-    const bodyB64 = btoa(unescape(encodeURIComponent(htmlBody)));
-    await talk(`${headers}\r\n${bodyB64}\r\n.\r\n`, [250]);
+    await talk(`${headers}\r\n${foldBase64(htmlBody)}\r\n.\r\n`, [250]);
 
     await talk('QUIT\r\n', [221]);
     return true;
   } catch (e: any) {
-    return 'SMTP: ' + (e?.message || String(e));
+    return 'SMTP: ' + String(e?.message || e);
+  } finally {
+    try {
+      socket?.close?.();
+    } catch {}
   }
 }
 

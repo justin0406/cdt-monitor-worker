@@ -270,8 +270,10 @@
                         </button>
                     </div>
                 </div>
-                <div v-if="statusData.length === 0" class="col-span-full py-20 text-center text-gray-400">
-                    <p>暂无监控账号，请点击右上角登录管理员添加。</p>
+            </div>
+            <div v-if="statusData.length === 0" class="col-span-full py-20 text-center text-gray-400">
+                    <p v-if="isAdmin">暂无监控账号，请在下方「系统配置」中添加账号。</p>
+                    <p v-else>请点击右上角「管理员登录」查看监控数据。</p>
                 </div>
         </main>
 
@@ -417,8 +419,25 @@
                         <div class="space-y-4">
                             <div class="space-y-1">
                                 <label class="text-xs font-medium text-gray-500 ml-2">管理员密码</label>
-                                <input v-model="config.admin_password" type="text"
+                                <input v-model="config.admin_password" type="password" autocomplete="new-password"
+                                    :placeholder="config.has_password ? '留空表示不修改' : '请设置管理员密码'"
                                     class="w-full glass-input rounded-xl px-4 py-2 text-sm">
+                            </div>
+                            <div class="space-y-1">
+                                <div class="flex items-center justify-between ml-2">
+                                    <label class="text-xs font-medium text-gray-500">API Key（组件/快捷指令）</label>
+                                    <button @click="regenerateApiKey"
+                                        class="text-[10px] text-gray-400 hover:text-[#FF3B30] transition-colors">重置</button>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <input :value="config.api_key || '（未生成）'" readonly
+                                        class="w-full glass-input rounded-xl px-4 py-2 text-[11px] font-mono text-gray-500">
+                                    <button @click="copyApiKey"
+                                        class="shrink-0 whitespace-nowrap px-3 py-2 rounded-xl border border-gray-300 text-xs text-gray-600 hover:bg-gray-50">复制</button>
+                                </div>
+                                <p class="text-[10px] text-gray-400 px-2 mt-1 leading-relaxed">
+                                    用于 <code>GET /api/v1/status</code>，请求头 <code>Authorization: Bearer &lt;key&gt;</code>。
+                                </p>
                             </div>
                             <div class="space-y-1">
                                 <label class="text-xs font-medium text-gray-500 ml-2">告警阈值 (%)</label>
@@ -628,7 +647,8 @@
                             </div>
                             <div class="space-y-1">
                                 <label class="text-xs font-medium text-gray-500 ml-2">Password</label>
-                                <input v-model="config.Notification.password" type="password"
+                                <input v-model="config.Notification.password" type="password" autocomplete="new-password"
+                                    placeholder="留空或保持掩码表示不修改"
                                     class="w-full glass-input rounded-xl px-4 py-2 text-sm">
                             </div>
                             <div class="space-y-1">
@@ -661,7 +681,8 @@
                             </div>
                             <div class="space-y-1">
                                 <label class="text-xs font-medium text-gray-500 ml-2">Bot Token</label>
-                                <input v-model="config.Notification.telegram.token" placeholder="来自 @BotFather"
+                                <input v-model="config.Notification.telegram.token"
+                                    :placeholder="config.Notification.telegram.token ? '已保存，留空表示不修改' : '来自 @BotFather'"
                                     class="w-full glass-input rounded-xl px-4 py-2 text-sm">
                             </div>
                             <div class="space-y-1">
@@ -806,7 +827,8 @@
                                     </div>
                                     <div class="space-y-1">
                                         <label class="text-xs font-medium text-gray-500 ml-2">AccessKey Secret</label>
-                                        <input v-model="acc.AccessKeySecret" type="password"
+                                        <input v-model="acc.AccessKeySecret" type="password" autocomplete="new-password"
+                                            :placeholder="acc.AccessKeySecret ? '已保存，留空或保持掩码表示不修改' : 'AccessKey Secret'"
                                             class="w-full glass-input rounded-xl px-4 py-2 text-sm">
                                     </div>
                                     <div class="space-y-1">
@@ -1136,6 +1158,10 @@
                 };
 
                 const performSetup = async () => {
+                    if (!setupData.value.admin_password || setupData.value.admin_password.trim().length < 4) {
+                        alert('管理员密码至少 4 位');
+                        return;
+                    }
                     try {
                         const res = await fetch('?action=setup', {
                             method: 'POST',
@@ -1162,8 +1188,10 @@
                             isAdmin.value = true;
                             fetchConfig();
                             startLogPolling(); // 登录后开始轮询日志
+                            fetchData();        // 状态接口需要登录，未登录时不再请求
+                        } else {
+                            loading.value = false; // 未登录时状态接口不可用，避免一直转圈
                         }
-                        fetchData();
                     } catch (e) {
                         console.error('Session check failed', e);
                     } finally {
@@ -1177,7 +1205,12 @@
                         const res = await fetch('?action=get_status');
                         const json = await res.json();
 
-                        if (json.error) {
+                        if (json.error === 'Unauthorized') {
+                            isAdmin.value = false;
+                            config.value = null;
+                            stopLogPolling();
+                            showLoginModal.value = true;
+                        } else if (json.error) {
                             criticalError.value = json.error;
                         } else {
                             statusData.value = json.data || [];
@@ -1424,7 +1457,7 @@
 
                 const toggleAdmin = () => {
                     if (isAdmin.value) {
-                        fetch('?action=logout').then(() => {
+                        fetch('?action=logout', { method: 'POST' }).then(() => {
                             isAdmin.value = false;
                             config.value = null;
                             systemLogs.value = [];
@@ -1448,6 +1481,7 @@
                             passwordInput.value = '';
                             fetchConfig();
                             startLogPolling();
+                            fetchData(); // 状态接口需要登录态，登录成功后立刻拉一次
                         } else {
                             alert(data.message || '登录失败');
                         }
@@ -1499,8 +1533,37 @@
                     try {
                         const res = await fetch('?action=save_config', { method: 'POST', body: JSON.stringify(config.value) });
                         const data = await res.json();
-                        if (data.success) { alert('配置已保存'); fetchData(); } else { alert('保存失败'); }
+                        if (data.success) {
+                            alert('配置已保存');
+                            // 密码/密钥不回传前端，保存后重新拉取以刷新掩码显示
+                            config.value.admin_password = '';
+                            fetchConfig();
+                            fetchData();
+                        } else { alert('保存失败: ' + (data.message || '未知错误')); }
                     } catch (e) { alert('保存请求失败'); }
+                };
+
+                const copyApiKey = async () => {
+                    const key = config.value && config.value.api_key;
+                    if (!key) { alert('尚未生成 API Key'); return; }
+                    try {
+                        await navigator.clipboard.writeText(key);
+                        alert('API Key 已复制');
+                    } catch (e) {
+                        prompt('请手动复制 API Key', key);
+                    }
+                };
+
+                const regenerateApiKey = async () => {
+                    if (!confirm('重置后旧的 API Key 立即失效，需要在组件里重新填写。确定继续？')) return;
+                    try {
+                        const res = await fetch('?action=regenerate_api_key', { method: 'POST' });
+                        const data = await res.json();
+                        if (data.success) {
+                            if (config.value) config.value.api_key = data.api_key;
+                            alert('API Key 已重置');
+                        } else { alert('重置失败'); }
+                    } catch (e) { alert('重置请求失败'); }
                 };
 
                 // 获取系统日志 (带Tab参数)
@@ -1604,7 +1667,8 @@
                     toggleInstance,
                     toggleAdmin, performLogin, saveConfig, sendTestEmail, sendingEmail, addAccount, removeAccount, getInstanceStatusColor, performSetup, refreshSingle, fetchLogs,
                     currentLogTab, clearLogs, logAutoRefresh,
-                    currentNotifyTab, testingTelegram, testingWebhook, sendTestTelegram, sendTestWebhook
+                    currentNotifyTab, testingTelegram, testingWebhook, sendTestTelegram, sendTestWebhook,
+                    copyApiKey, regenerateApiKey
                 };
             }
         }).mount('#app');

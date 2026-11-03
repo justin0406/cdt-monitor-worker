@@ -1,7 +1,6 @@
 name = "cdt-monitor"
 main = "src/index.ts"
 compatibility_date = "2026-08-01"
-compatibility_flags = ["nodejs_compat"]
 
 # 静态面板 (原版 template.html + vue + echarts)
 [assets]
@@ -19,3 +18,7 @@ database_name = "cdt_monitor"
 # 每分钟触发监控（对应原版 cron * * * * *）
 [triggers]
 crons = ["* * * * *"]
+
+# cron 的执行日志/异常在 Dashboard -> Logs 里查看
+[observability]
+enabled = true

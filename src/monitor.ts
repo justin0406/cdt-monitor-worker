@@ -38,10 +38,6 @@ export class Monitor {
 
   constructor(private store: Store) {}
 
-  private async getNotifier(): Promise<Notifier> {
-    return new Notifier(await this.store.getAllSettings());
-  }
-
   private async logNotificationResult(result: true | string | undefined, key: string) {
     if (result === true) {
       await this.store.addLog('info', `通知推送成功 [${key}]`);
@@ -85,27 +81,39 @@ export class Monitor {
     const settings = await this.store.getAllSettings();
     const notifier = new Notifier(settings);
 
-    // 清理
-    await this.store.pruneLogs();
-    await this.store.pruneStats();
-    await this.store.pruneBillingCache();
+    const currentTime = Math.floor(Date.now() / 1000);
+    const { h, m } = shanghaiHourMinute();
+
+    // 清理：D1 按行计费，且 pruneStats 的 DELETE 走不了索引会全表扫描，
+    // 没必要每分钟跑一次，改为每小时一次（用 last_prune 游标控制）
+    const lastPrune = parseInt(settings['last_prune'] || '0', 10) || 0;
+    if (currentTime - lastPrune >= 3600) {
+      await this.store.pruneLogs();
+      await this.store.pruneStats();
+      await this.store.pruneBillingCache();
+      await this.store.saveSetting('last_prune', currentTime);
+      settings['last_prune'] = String(currentTime);
+    }
 
     // 每天 04:00 清理旧登录尝试（对应原版 VACUUM 时机的近似）
-    const { h, m } = shanghaiHourMinute();
     if (h === '04' && m === '00') {
-      await this.store.db.prepare('DELETE FROM login_attempts WHERE attempt_time < ?').bind(Math.floor(Date.now() / 1000) - 7 * 86400).run();
+      await this.store.db.prepare('DELETE FROM login_attempts WHERE attempt_time < ?').bind(currentTime - 7 * 86400).run();
     }
 
     const currentUserTime = shanghaiTimeStr();
-    const currentTime = Math.floor(Date.now() / 1000);
     const threshold = parseInt(settings['traffic_threshold'] || '95', 10) || 95;
     const shutdownMode = settings['shutdown_mode'] || 'KeepCharging';
     const thresholdAction = settings['threshold_action'] || 'stop_and_notify';
     const keepAlive = settings['keep_alive'] === '1';
+    const enableBilling = settings['enable_billing'] === '1';
     const userInterval = parseInt(settings['api_interval'] || '600', 10) || 600;
 
     const accounts = await this.store.getAccounts();
     const logs: string[] = [];
+    // 心跳降频基准必须在循环外取一次：原来在循环内取，多账号时 A 记账后 B 会被
+    // "5 分钟内不记" 直接吞掉，导致 B 的心跳日志永久缺失。
+    const lastHeartbeat = await this.store.getLastHeartbeatTime();
+
 
     for (const account of accounts) {
       const logPrefix = `[${account.access_key_id}]`;
@@ -118,10 +126,14 @@ export class Monitor {
       let lastUpdate = account.updated_at || 0;
 
       // ---- 1. 定时任务（按 Asia/Shanghai 时间）----
+      // 分钟级去重键：同一天同一分钟只执行一次，避免 cron 重入/重试导致重复开关机
+      const schedMinute = `${shanghaiDate(currentTime)} ${currentUserTime}`;
       if (account.schedule_enabled == 1) {
-        if (account.start_time && currentUserTime === account.start_time) {
+        if (account.start_time && currentUserTime === account.start_time && settings[`sched_start_${account.id}`] !== schedMinute) {
           if (await this.safeControlInstance(account, 'start')) {
             actions.push('定时启动');
+            settings[`sched_start_${account.id}`] = schedMinute;
+            await this.store.saveSetting(`sched_start_${account.id}`, schedMinute);
             await this.store.addLog('info', `执行定时启动 [${account.access_key_id}]`);
             const mailRes = await notifier.notifySchedule('定时启动', account, '计划任务已触发，实例正在启动。');
             await this.logNotificationResult(mailRes, account.access_key_id);
@@ -129,9 +141,11 @@ export class Monitor {
             statusTransformed = true;
           }
         }
-        if (account.stop_time && currentUserTime === account.stop_time) {
+        if (account.stop_time && currentUserTime === account.stop_time && settings[`sched_stop_${account.id}`] !== schedMinute) {
           if (await this.safeControlInstance(account, 'stop', shutdownMode)) {
             actions.push(`定时停止(${shutdownMode})`);
+            settings[`sched_stop_${account.id}`] = schedMinute;
+            await this.store.saveSetting(`sched_stop_${account.id}`, schedMinute);
             await this.store.addLog('info', `执行定时停止 [${account.access_key_id}]`);
             const mailRes = await notifier.notifySchedule('定时停止', account, '计划任务已触发，实例已停止。');
             await this.logNotificationResult(mailRes, account.access_key_id);
@@ -147,6 +161,12 @@ export class Monitor {
       let shouldCheckApi = forceRefresh || currentTime - lastUpdate > currentInterval;
       const mm = shanghaiHourMinute().m;
       if (mm === '00') shouldCheckApi = true;
+
+      // 连续失败退避：API 挂了时不能每分钟打满重试，否则更容易被阿里云限流
+      const backoffKey = `backoff_${account.id}`;
+      const failKey = `fail_${account.id}`;
+      const backoffUntil = parseInt(settings[backoffKey] || '0', 10) || 0;
+      if (!forceRefresh && currentTime < backoffUntil) shouldCheckApi = false;
 
       let newUpdateTime = currentTime;
 
@@ -176,10 +196,27 @@ export class Monitor {
           apiStatusLog += TRANSIENT_STATES.includes(newStatus) ? ' [过渡态]' : ' [稳定态]';
         }
 
+        // 失败计数 → 连续 2 次失败进入 5 分钟退避，成功则清零
+        if (newTraffic < 0 || newStatus === 'Unknown') {
+          const fails = (parseInt(settings[failKey] || '0', 10) || 0) + 1;
+          settings[failKey] = String(fails);
+          if (fails >= 2) {
+            const until = currentTime + 300;
+            settings[backoffKey] = String(until);
+            settings[failKey] = '0';
+            await this.store.saveSettings([['backoff_' + account.id, until], ['fail_' + account.id, 0]]);
+          } else {
+            await this.store.saveSetting(failKey, fails);
+          }
+        } else if (parseInt(settings[failKey] || '0', 10)) {
+          settings[failKey] = '0';
+          await this.store.saveSetting(failKey, 0);
+        }
+
         await this.store.updateAccountStatus(account.id, traffic, status, newUpdateTime);
       } else {
-        const timeLeft = currentInterval - (currentTime - lastUpdate);
-        apiStatusLog = `缓存(${timeLeft}s)`;
+        const timeLeft = Math.max(0, currentInterval - (currentTime - lastUpdate));
+        apiStatusLog = currentTime < backoffUntil ? `缓存(接口退避中,${backoffUntil - currentTime}s)` : `缓存(${timeLeft}s)`;
       }
 
       // ---- 3. 流量熔断 ----
@@ -187,26 +224,36 @@ export class Monitor {
       const usagePercent = maxTraffic > 0 ? Math.round((traffic / maxTraffic) * 10000) / 100 : 0;
       let trafficDesc = `流量:${usagePercent}%`;
       const isOverThreshold = usagePercent >= threshold;
+      // 告警去重：超限期间只推一次，回落到阈值以下才复位（否则每 10 分钟一封邮件）
+      const alertKey = `alert_${account.id}`;
+      const alreadyAlerted = settings[alertKey] === '1';
 
       if (isOverThreshold) {
         trafficDesc += '[警告]';
-        if (shouldCheckApi) {
-          if (thresholdAction === 'stop_and_notify') {
-            if (status !== 'Stopped') {
-              if (await this.safeControlInstance(account, 'stop', shutdownMode)) {
-                actions.push('超限关机');
-                await this.store.addLog('warning', `流量超限自动关机 [${account.access_key_id}] 使用率:${usagePercent}%`);
-                await this.store.updateAccountStatus(account.id, traffic, 'Stopping', currentTime);
-                status = 'Stopping';
-              }
-            }
-          } else {
+        // 关机动作每次刷新都尝试（实例可能被外部重新拉起），通知则只发一次
+        if (shouldCheckApi && thresholdAction === 'stop_and_notify' && !['Stopped', 'Stopping'].includes(status)) {
+          if (await this.safeControlInstance(account, 'stop', shutdownMode)) {
+            actions.push('超限关机');
+            await this.store.addLog('warning', `流量超限自动关机 [${account.access_key_id}] 使用率:${usagePercent}%`);
+            await this.store.updateAccountStatus(account.id, traffic, 'Stopping', currentTime);
+            status = 'Stopping';
+          }
+        }
+        if (shouldCheckApi && !alreadyAlerted) {
+          if (thresholdAction !== 'stop_and_notify') {
             actions.push('超限告警');
             await this.store.addLog('warning', `流量超限触发告警 [${account.access_key_id}] 使用率:${usagePercent}%`);
           }
-          const mailRes = await notifier.sendTrafficWarning(account.access_key_id, traffic, usagePercent, actions.join(',') || '超限', threshold);
+          settings[alertKey] = '1';
+          await this.store.saveSetting(alertKey, '1');
+          const statusText = actions.includes('超限关机') ? '超限关机' : '超限';
+          const mailRes = await notifier.sendTrafficWarning(account.access_key_id, traffic, usagePercent, statusText, threshold);
           await this.logNotificationResult(mailRes, account.access_key_id);
         }
+      } else if (alreadyAlerted) {
+        settings[alertKey] = '0';
+        await this.store.saveSetting(alertKey, '0');
+        await this.store.addLog('info', `流量回落至阈值以下 [${account.access_key_id}] 使用率:${usagePercent}%`);
       }
 
       // ---- 4. 保活逻辑 ----
@@ -233,11 +280,15 @@ export class Monitor {
         apiStatusLog += ' -> 强制过渡态';
       }
 
+      // ---- 5. 费用缓存预热（每账号每 6 小时最多一次 API 调用，命中缓存则不请求）----
+      if (enableBilling) {
+        await this.safeGetBillingInfo(account, shanghaiMonth());
+      }
+
       const actionLog = actions.length ? actions.join(', ') : '无动作';
       const logLine = `${logPrefix} ${actionLog} | ${trafficDesc} | ${status} | ${apiStatusLog}`;
       // 心跳日志降频：有动作立即记；无动作时 5 分钟记一条（原版每分钟记，但 D1 按行计费，降频可大幅减少读写量）
-      const lastHb = await this.store.getLastHeartbeatTime();
-      if (actions.length > 0 || currentTime - lastHb >= 300) {
+      if (actions.length > 0 || currentTime - lastHeartbeat >= 300) {
         await this.store.addLog('heartbeat', logLine);
       }
       logs.push(logLine);
@@ -247,68 +298,110 @@ export class Monitor {
     return logs.join('\n');
   }
 
-  /** 前端状态卡片 — 对应 getStatusForFrontend */
+  /** 面板状态卡片 — 只读 D1 缓存，不触发任何阿里云调用
+   *  采集统一由每分钟 cron 负责：面板刷新再也不会烧 API 配额，未登录用户也拿不到数据 */
   async getStatusForFrontend(): Promise<any> {
     const settings = await this.store.getAllSettings();
     const threshold = parseInt(settings['traffic_threshold'] || '95', 10) || 95;
-    const userInterval = parseInt(settings['api_interval'] || '600', 10) || 600;
     const billingEnabled = settings['enable_billing'] === '1';
-    const currentTime = Math.floor(Date.now() / 1000);
     const accounts = await this.store.getAccounts();
     const billingCycle = shanghaiMonth();
 
     const data = [];
     for (const account of accounts) {
-      const lastUpdate = account.updated_at || 0;
-      let cachedStatus = account.instance_status || 'Unknown';
-      const isTransient = TRANSIENT_STATES.includes(cachedStatus);
-      const checkInterval = isTransient ? 60 : userInterval;
-      let traffic = account.traffic_used;
-      let status = cachedStatus;
-      let newUpdateTime = currentTime;
+      data.push(await this.buildStatusItem(account, threshold, billingEnabled, billingCycle));
+    }
+    return { data, system_last_run: await this.store.getLastRunTime() };
+  }
 
-      if (currentTime - lastUpdate > checkInterval) {
-        const newTraffic = await this.safeGetTraffic(account);
-        let newStatus = await this.safeGetInstanceStatus(account);
-        if (newStatus === 'Unknown') {
-          await new Promise((r) => setTimeout(r, 500));
-          newStatus = await this.safeGetInstanceStatus(account);
-        }
-        if (newTraffic >= 0) {
-          traffic = newTraffic;
-          await this.store.addHourlyStat(account.id, traffic);
-          await this.store.addDailyStat(account.id, traffic);
-        } else {
-          newUpdateTime = lastUpdate;
-        }
-        if (newStatus === 'Unknown') newUpdateTime = lastUpdate;
-        else status = newStatus;
-        await this.store.updateAccountStatus(account.id, traffic, status, newUpdateTime);
-      }
+  /** Scriptable / 快捷指令组件接口 — 只读缓存，字段兼容 CDT-Monitor-scriptable.js */
+  async getWidgetStatus(): Promise<any> {
+    const settings = await this.store.getAllSettings();
+    const threshold = parseInt(settings['traffic_threshold'] || '95', 10) || 95;
+    const billingEnabled = settings['enable_billing'] === '1';
+    const accounts = await this.store.getAccounts();
+    const billingCycle = shanghaiMonth();
 
-      const usagePercent = account.max_traffic > 0 ? Math.round((traffic / account.max_traffic) * 10000) / 100 : 0;
-      const item: any = {
-        id: account.id,
-        account: String(account.access_key_id).slice(0, 7) + '***',
-        flow_total: account.max_traffic,
-        flow_used: Math.round(traffic * 100) / 100,
-        percentageOfUse: usagePercent,
-        region: account.region_id,
-        regionName: REGION_NAMES[account.region_id] || account.region_id,
-        rate95: usagePercent >= threshold,
-        threshold,
-        instanceStatus: status,
-        lastUpdated: fmtTime(lastUpdate > 0 ? lastUpdate : currentTime),
-        remark: account.remark || '',
-      };
-
-      if (billingEnabled) {
-        item.cost = await this.safeGetBillingInfo(account, billingCycle);
-      }
-      data.push(item);
+    const list = [];
+    for (const account of accounts) {
+      const item = await this.buildStatusItem(account, threshold, billingEnabled, billingCycle);
+      list.push({
+        account: item.account,
+        remark: item.remark,
+        region: item.region,
+        region_name: item.regionName,
+        status: item.instanceStatus,
+        instance_status: item.instanceStatus,
+        flow_used: item.flow_used,
+        flow_total: item.flow_total,
+        percentage: item.percentageOfUse,
+        threshold: item.threshold,
+        monthly_cost: item.cost ? item.cost.monthly_cost : null,
+        balance: item.cost ? item.cost.balance : null,
+        currency: item.cost ? item.cost.currency : 'CNY',
+        last_updated: item.lastUpdated,
+      });
     }
 
-    return { data, system_last_run: await this.store.getLastRunTime() };
+    return {
+      accounts: list,
+      system_last_run: await this.store.getLastRunTime(),
+      updated_at: fmtTime(Math.floor(Date.now() / 1000)),
+    };
+  }
+
+  private async buildStatusItem(account: Account, threshold: number, billingEnabled: boolean, billingCycle: string): Promise<any> {
+    const lastUpdate = account.updated_at || 0;
+    const traffic = account.traffic_used;
+    const status = account.instance_status || 'Unknown';
+    const usagePercent = account.max_traffic > 0 ? Math.round((traffic / account.max_traffic) * 10000) / 100 : 0;
+
+    const item: any = {
+      id: account.id,
+      account: String(account.access_key_id).slice(0, 7) + '***',
+      flow_total: account.max_traffic,
+      flow_used: Math.round(traffic * 100) / 100,
+      percentageOfUse: usagePercent,
+      region: account.region_id,
+      regionName: REGION_NAMES[account.region_id] || account.region_id,
+      rate95: usagePercent >= threshold,
+      threshold,
+      instanceStatus: status,
+      lastUpdated: lastUpdate > 0 ? fmtTime(lastUpdate) : '尚未采集',
+      remark: account.remark || '',
+    };
+
+    if (billingEnabled) {
+      item.cost = await this.readBilling(account, billingCycle);
+    }
+    return item;
+  }
+
+  /** 只读账单缓存（允许 7 天内旧数据，避免面板/组件请求触发 BSS 调用） */
+  private async readBilling(account: Account, billingCycle: string): Promise<any> {
+    const costInfo: any = {
+      enabled: true,
+      monthly_cost: null,
+      balance: null,
+      currency: 'CNY',
+      last_updated: null,
+      error: null,
+    };
+
+    const sevenDays = 7 * 86400;
+    const balanceCache = await this.store.getBillingCache(account.id, 'balance', '', sevenDays);
+    if (balanceCache) {
+      costInfo.balance = balanceCache.AvailableAmount;
+      costInfo.currency = balanceCache.Currency || 'CNY';
+    }
+    if (account.instance_id) {
+      const billCache = await this.store.getBillingCache(account.id, 'instance_bill', billingCycle, sevenDays);
+      if (billCache) costInfo.monthly_cost = billCache.TotalCost;
+    }
+    if (costInfo.balance === null && costInfo.monthly_cost === null) {
+      costInfo.error = '账单缓存为空，等待定时任务采集';
+    }
+    return costInfo;
   }
 
   /** 手动刷新单个账号 — 对应 refreshAccount */

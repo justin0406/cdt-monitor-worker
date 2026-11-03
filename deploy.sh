@@ -22,7 +22,9 @@ if ! npx wrangler whoami >/dev/null 2>&1; then
   warn "未登录，正在打开浏览器授权（如无浏览器请用 API Token: export CLOUDFLARE_API_TOKEN=xxx）"
   npx wrangler login
 fi
-npx wrangler whoami 2>&1 | grep -q "You are not authenticated" && err "登录失败，请重试"
+if ! npx wrangler whoami 2>&1 | grep -qE "Account Name|account_id|You are logged in"; then
+  err "登录校验失败（wrangler 输出可能已变更），请手动执行 npx wrangler whoami 确认"
+fi
 info "已登录 Cloudflare"
 
 # ---------- 2. 部署（D1 自动创建/复用） ----------

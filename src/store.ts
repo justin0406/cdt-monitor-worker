@@ -112,6 +112,26 @@ export class Store {
       .run();
   }
 
+  /** 批量写设置（saveConfig 一次保存 30+ 项，逐条写会放大 D1 往返与计费行数） */
+  async saveSettings(pairs: [string, string | number][]): Promise<void> {
+    if (!pairs.length) return;
+    const stmts = pairs.map(([k, v]) =>
+      this.db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)').bind(k, String(v)),
+    );
+    await this.db.batch(stmts);
+  }
+
+  /** 读取设置，不存在则生成并落库（并发安全：INSERT OR IGNORE 后回读） */
+  async getOrCreateSetting(key: string, gen: () => string): Promise<string> {
+    const cur = await this.getSetting(key);
+    if (cur) return cur;
+    await this.db
+      .prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+      .bind(key, gen())
+      .run();
+    return (await this.getSetting(key)) || '';
+  }
+
   async updateLastRunTime(t: number): Promise<void> {
     await this.saveSetting('last_monitor_run', t);
   }
@@ -344,96 +364,63 @@ export class Store {
   }
 }
 
+/** 东八区 (Asia/Shanghai) 时间工具
+ *  1991 年后中国无夏令时，UTC+8 固定偏移与 Intl 完全等价。
+ *  Workers 每次 new Intl.DateTimeFormat 都是重量级操作（monitor 循环 / 日志列表里按行调用），
+ *  改用纯算术后 CPU 开销降低一两个数量级。 */
+const CST_OFFSET = 8 * 3600;
+const p2 = (n: number) => String(n).padStart(2, '0');
+
+function cstParts(ts: number) {
+  const d = new Date((ts + CST_OFFSET) * 1000);
+  return {
+    y: d.getUTCFullYear(),
+    mo: d.getUTCMonth() + 1,
+    d: d.getUTCDate(),
+    h: d.getUTCHours(),
+    mi: d.getUTCMinutes(),
+    s: d.getUTCSeconds(),
+  };
+}
+
 /** 东八区 (Asia/Shanghai) 格式化时间戳 → YYYY-MM-DD HH:mm:ss */
 export function fmtTime(ts: number): string {
-  const d = new Date(ts * 1000);
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false,
-  }).formatToParts(d);
-  const get = (t: string) => parts.find((p) => p.type === t)?.value || '00';
-  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
+  const p = cstParts(ts);
+  return `${p.y}-${p2(p.mo)}-${p2(p.d)} ${p2(p.h)}:${p2(p.mi)}:${p2(p.s)}`;
 }
 
 /** 东八区 (Asia/Shanghai) 当前日期 YYYY-MM（阿里云账单周期按中国时区） */
 export function shanghaiMonth(): string {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-  }).formatToParts(new Date());
-  const get = (t: string) => parts.find((p) => p.type === t)?.value || '0';
-  const pad = (s: string) => String(Number(s)).padStart(2, '0');
-  return `${get('year')}-${pad(get('month'))}`;
+  const p = cstParts(Math.floor(Date.now() / 1000));
+  return `${p.y}-${p2(p.mo)}`;
 }
 
 /** 东八区 (Asia/Shanghai) 指定时间戳 → HH:mm（图表横轴） */
 export function shanghaiHM(ts: number): string {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(new Date(ts * 1000));
-  const h = parts.find((p) => p.type === 'hour')?.value || '00';
-  const m = parts.find((p) => p.type === 'minute')?.value || '00';
-  return `${h}:${m}`;
+  const p = cstParts(ts);
+  return `${p2(p.h)}:${p2(p.mi)}`;
 }
 
 /** 东八区 (Asia/Shanghai) 指定时间戳 → YYYY-MM-DD（图表 30 天横轴） */
 export function shanghaiDate(ts: number): string {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(new Date(ts * 1000));
-  const get = (t: string) => parts.find((p) => p.type === t)?.value || '00';
-  return `${get('year')}-${get('month')}-${get('day')}`;
+  const p = cstParts(ts);
+  return `${p.y}-${p2(p.mo)}-${p2(p.d)}`;
 }
 
 /** 东八区 (Asia/Shanghai) 当天 0 点时间戳（日统计粒度） */
 export function shanghaiDayStart(ts: number): number {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(new Date(ts * 1000));
-  const get = (t: string) => parts.find((p) => p.type === t)?.value || '0';
-  // 用 Date.UTC 构造东八区当天 0 点，再减去 8 小时得到 UTC 时间戳
-  return Math.floor(Date.UTC(Number(get('year')), Number(get('month')) - 1, Number(get('day'))) / 1000) - 8 * 3600;
+  const p = cstParts(ts);
+  return Math.floor(Date.UTC(p.y, p.mo - 1, p.d) / 1000) - CST_OFFSET;
 }
 
 /** Asia/Shanghai 时区当前时间字符串 HH:mm */
 export function shanghaiTimeStr(): string {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(new Date());
-  const h = parts.find((p) => p.type === 'hour')?.value || '00';
-  const m = parts.find((p) => p.type === 'minute')?.value || '00';
-  return `${h}:${m}`;
+  const p = cstParts(Math.floor(Date.now() / 1000));
+  return `${p2(p.h)}:${p2(p.mi)}`;
 }
 
-/** Asia/Shanghai 时区当前 HH 是否等于指定值（用于凌晨维护窗口） */
+/** Asia/Shanghai 时区当前 HH / mm（用于凌晨维护窗口与整点判断） */
 export function shanghaiHourMinute(): { h: string; m: string } {
-  const parts = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  }).formatToParts(new Date());
-  return {
-    h: parts.find((p) => p.type === 'hour')?.value || '00',
-    m: parts.find((p) => p.type === 'minute')?.value || '00',
-  };
+  const p = cstParts(Math.floor(Date.now() / 1000));
+  return { h: p2(p.h), m: p2(p.mi) };
 }

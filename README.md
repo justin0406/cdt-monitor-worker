@@ -13,7 +13,8 @@
 - ✅ **费用分析** — 余额 + 实例当月账单（BSS API，带 6 小时缓存）
 - ✅ **历史图表** — 近 24 小时曲线 + 近 30 天柱状图（ECharts）
 - ✅ **系统日志** — 动作日志 / 心跳日志双 Tab，自动清理
-- ✅ **登录保护** — HMAC 签名会话 Cookie + IP 失败锁定（15 分钟 5 次）
+- ✅ **登录保护** — HMAC 签名会话 Cookie（密钥可由 `SESSION_SECRET` 指定）+ IP 失败锁定（15 分钟 5 次）
+- ✅ **组件 API** — `GET /api/v1/status` + Bearer Key，兼容 [CDT-Monitor-scriptable.js](https://github.com/yisaings/surge/blob/main/CDT-Monitor-scriptable.js) 桌面小组件
 - ✅ **前端面板** — 原版 Vue + Tailwind 面板，未改动一行 UI 逻辑
 
 ## 架构对比
@@ -35,16 +36,18 @@
 
 1. **连接仓库**
    - Dashboard → Workers & Pages → **Create** → **Workers** → **Deploy with Git**
-   - 授权 GitHub → 选择 `kfqkfy/cdt-monitor-worker` → 分支 `main`
+   - 授权 GitHub → 选择 `justin0406/cdt-monitor-worker` → 分支 `main`
    - 构建/部署命令保持默认（`npm run deploy`）
-2. **添加 Cron 触发器**（监控需要，可选但建议）
+2. **设置会话密钥**（强烈建议，否则会话密钥会在首次请求时随机生成并存到 D1）
+   - 本地执行：`npx wrangler secret put SESSION_SECRET`（随便一段 32 位以上随机串）
+3. **添加 Cron 触发器**（监控需要，可选但建议）
    - **Settings** → **Triggers** → **Cron Triggers** → `* * * * *`
-3. **初始化表结构**（首次部署后执行一次）
+4. **初始化表结构**（首次部署后执行一次）
    - 项目 → **Console** 运行（或本地执行）：
    ```bash
    npx wrangler d1 execute cdt_monitor --remote --file=./schema.sql
    ```
-4. **完成** — 以后每次 `git push` 到 main 自动重新部署
+5. **完成** — 以后每次 `git push` 到 main 自动重新部署
 
 > 💡 `wrangler.toml` 中 D1 绑定只声明 `database_name` 不写 `database_id`，wrangler 部署时会自动创建同名数据库（若不存在）或复用（若已存在），无需手动绑定。
 
@@ -53,7 +56,7 @@
 只需 Node.js 18+，一条命令：
 
 ```bash
-git clone git@github.com:kfqkfy/cdt-monitor-worker.git
+git clone git@github.com:justin0406/cdt-monitor-worker.git
 cd cdt-monitor-worker
 ./deploy.sh
 ```
@@ -62,12 +65,12 @@ cd cdt-monitor-worker
 
 ### 方式三：Deploy Button（一次性部署，仅适合尝鲜）
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/kfqkfy/cdt-monitor-worker)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/justin0406/cdt-monitor-worker)
 
 点击按钮 → 授权 → 按引导创建资源并部署。⚠️ 每次部署独立，**代码更新不会自动重新部署**，且需要手动处理 D1 绑定，长期使用请用方式一或方式二。
 
 ```bash
-git clone git@github.com:kfqkfy/cdt-monitor-worker.git
+git clone git@github.com:justin0406/cdt-monitor-worker.git
 cd cdt-monitor-worker
 npm install
 npx wrangler d1 create cdt_monitor        # 把输出的 database_id 填入 wrangler.toml
@@ -80,6 +83,39 @@ npx wrangler deploy
 ### 初始化系统
 
 浏览器打开上面的 URL → 首次访问进入初始化向导 → 设置管理员密码 → 添加阿里云账号（AccessKey/Secret、区域、实例 ID、流量上限、定时计划）→ 保存。
+
+## 对外组件 API
+
+面板地址之外，Worker 额外暴露一个只读接口，供 iPhone 桌面小组件 / 快捷指令 / 自建脚本使用：
+
+```
+GET {面板地址}/api/v1/status
+Authorization: Bearer <api_key>
+```
+
+- `api_key` 在 **面板 → 系统配置 → API Key** 中查看/复制，可随时重置（旧 key 立即失效）
+- 该接口**只读 D1 缓存**，不触发任何阿里云调用，因此可以放心给组件高频轮询
+- 返回结构（字段对齐 `CDT-Monitor-scriptable.js`）：
+
+```json
+{
+  "accounts": [{
+    "account": "LTAI5tA***",
+    "region_name": "中国香港",
+    "instance_status": "Running",
+    "flow_used": 12.34,
+    "flow_total": 200,
+    "percentage": 6.17,
+    "threshold": 95,
+    "monthly_cost": 1.23,
+    "currency": "CNY",
+    "last_updated": "2026-11-03 12:00:00"
+  }],
+  "system_last_run": 1793683369
+}
+```
+
+> 数据由每分钟的 cron 采集，组件拿到的是「最近一次采集结果」，不是实时值。
 
 ## 本地开发
 
@@ -106,6 +142,9 @@ curl "http://localhost:8787/cdn-cgi/local/scheduled" -X POST      # 手动触发
 - 通知渠道 SMTP 依赖 Workers 的 Socket API，免费计划可用
 - Telegram 支持自定义 API 代理地址（`proxy_type=custom`）
 - 数据存在 Cloudflare D1（免费 5GB），账号密钥以明文存储于 D1（与原版 SQLite 一致），请勿公开面板地址
+- 前端拿到的密钥一律是掩码（`********后4位`），留空或保持掩码保存表示"不修改"
+- 面板接口除非显式标注，均需要登录态；写操作只接受 POST
+- 静态资源通过 `static/_headers` 设置长缓存，`index.html` 保持 no-cache，升级后刷新即可生效
 
 ## License
 
