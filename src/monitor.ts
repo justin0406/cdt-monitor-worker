@@ -27,6 +27,19 @@ const REGION_NAMES: Record<string, string> = {
 
 const TRANSIENT_STATES = ['Starting', 'Stopping', 'Pending', 'Unknown'];
 
+/** "HH:mm" → 当天分钟数，非法返回 -1 */
+function parseHHMM(value: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+  if (!m) return -1;
+  const hh = Number(m[1]);
+  const mm = Number(m[2]);
+  if (hh > 23 || mm > 59) return -1;
+  return hh * 60 + mm;
+}
+
+/** 计划任务补跑窗口（分钟）：cron 漏跑一两次也能在窗口内补上 */
+const SCHEDULE_CATCHUP_MINUTES = 30;
+
 function isTimeInRange(current: string, start: string, end: string): boolean {
   if (!start || !end) return false;
   if (start < end) return current >= start && current < end;
@@ -126,14 +139,27 @@ export class Monitor {
       let lastUpdate = account.updated_at || 0;
 
       // ---- 1. 定时任务（按 Asia/Shanghai 时间）----
-      // 分钟级去重键：同一天同一分钟只执行一次，避免 cron 重入/重试导致重复开关机
-      const schedMinute = `${shanghaiDate(currentTime)} ${currentUserTime}`;
+      // 到点后 SCHEDULE_CATCHUP_MINUTES 分钟内都算"该执行"：cron 漏跑一两次也能补上，
+      // 去重键按"计划所属日期 + 计划时间"生成，同一天同一计划点只执行一次。
+      const minutesNow = Number(h) * 60 + Number(m);
+      const planWindow = (plan: string): { inWindow: boolean; key: string } => {
+        const at = parseHHMM(plan);
+        if (at < 0) return { inWindow: false, key: '' };
+        const diff = (minutesNow - at + 1440) % 1440;
+        // 跨零点时该计划属于前一天（例如 23:50 的计划在 00:10 补跑）
+        const dayOffset = minutesNow < at ? -1 : 0;
+        return {
+          inWindow: diff < SCHEDULE_CATCHUP_MINUTES,
+          key: `${shanghaiDate(currentTime + dayOffset * 86400)} ${plan}`,
+        };
+      };
       if (account.schedule_enabled == 1) {
-        if (account.start_time && currentUserTime === account.start_time && settings[`sched_start_${account.id}`] !== schedMinute) {
+        const startPlan = account.start_time ? planWindow(account.start_time) : { inWindow: false, key: '' };
+        if (startPlan.inWindow && settings[`sched_start_${account.id}`] !== startPlan.key) {
           if (await this.safeControlInstance(account, 'start')) {
             actions.push('定时启动');
-            settings[`sched_start_${account.id}`] = schedMinute;
-            await this.store.saveSetting(`sched_start_${account.id}`, schedMinute);
+            settings[`sched_start_${account.id}`] = startPlan.key;
+            await this.store.saveSetting(`sched_start_${account.id}`, startPlan.key);
             await this.store.addLog('info', `执行定时启动 [${account.access_key_id}]`);
             const mailRes = await notifier.notifySchedule('定时启动', account, '计划任务已触发，实例正在启动。');
             await this.logNotificationResult(mailRes, account.access_key_id);
@@ -141,11 +167,12 @@ export class Monitor {
             statusTransformed = true;
           }
         }
-        if (account.stop_time && currentUserTime === account.stop_time && settings[`sched_stop_${account.id}`] !== schedMinute) {
+        const stopPlan = account.stop_time ? planWindow(account.stop_time) : { inWindow: false, key: '' };
+        if (stopPlan.inWindow && settings[`sched_stop_${account.id}`] !== stopPlan.key) {
           if (await this.safeControlInstance(account, 'stop', shutdownMode)) {
             actions.push(`定时停止(${shutdownMode})`);
-            settings[`sched_stop_${account.id}`] = schedMinute;
-            await this.store.saveSetting(`sched_stop_${account.id}`, schedMinute);
+            settings[`sched_stop_${account.id}`] = stopPlan.key;
+            await this.store.saveSetting(`sched_stop_${account.id}`, stopPlan.key);
             await this.store.addLog('info', `执行定时停止 [${account.access_key_id}]`);
             const mailRes = await notifier.notifySchedule('定时停止', account, '计划任务已触发，实例已停止。');
             await this.logNotificationResult(mailRes, account.access_key_id);

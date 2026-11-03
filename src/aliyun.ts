@@ -150,6 +150,8 @@ export class AliyunClient {
   }
 
   private isOverseas(regionId: string): boolean {
+    // 空值按"国内"处理：未填 region 时不应把国内流量算进海外口径
+    if (!regionId) return false;
     return !(regionId.startsWith('cn-') && regionId !== 'cn-hongkong');
   }
 

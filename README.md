@@ -143,6 +143,7 @@ curl "http://localhost:8787/cdn-cgi/local/scheduled" -X POST      # 手动触发
 ## 注意事项
 
 - 定时任务按 **Asia/Shanghai** 时区执行（与原版 Docker 一致）
+- 定时开关机有 30 分钟补跑窗口：cron 漏跑一两次也会补上，同一计划点当天只执行一次
 - 通知渠道 SMTP 依赖 Workers 的 Socket API，免费计划可用
 - Telegram 支持自定义 API 代理地址（`proxy_type=custom`）
 - 数据存在 Cloudflare D1（免费 5GB），账号密钥以明文存储于 D1（与原版 SQLite 一致），请勿公开面板地址
