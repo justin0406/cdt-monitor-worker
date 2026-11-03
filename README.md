@@ -95,7 +95,11 @@ Authorization: Bearer <api_key>
 
 - `api_key` 在 **面板 → 系统配置 → API Key** 中查看/复制，可随时重置（旧 key 立即失效）
 - 该接口**只读 D1 缓存**，不触发任何阿里云调用，因此可以放心给组件高频轮询
-- 返回结构（字段对齐 `CDT-Monitor-scriptable.js`）：
+- 同时返回两套结构，方便不同脚本直接复用：
+- `data` — 与面板 `?action=get_status` 完全一致（`percentageOfUse` / `instanceStatus` / `cost.monthly_cost`…），适配直接读 `data[0]` 的组件脚本
+- `accounts` — 蛇形字段（`percentage` / `instance_status` / `monthly_cost`…），适配 `CDT-Monitor-scriptable.js`
+
+示例（`accounts` 部分）：
 
 ```json
 {

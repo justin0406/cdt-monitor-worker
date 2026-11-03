@@ -322,9 +322,12 @@ export class Monitor {
     const accounts = await this.store.getAccounts();
     const billingCycle = shanghaiMonth();
 
-    const list = [];
+    const list: any[] = [];
+    // data：与面板 get_status 完全一致的结构（兼容直接读 ?action=get_status 的脚本）
+    const panelData: any[] = [];
     for (const account of accounts) {
       const item = await this.buildStatusItem(account, threshold, billingEnabled, billingCycle);
+      panelData.push(item);
       list.push({
         account: item.account,
         remark: item.remark,
@@ -344,6 +347,7 @@ export class Monitor {
     }
 
     return {
+      data: panelData,
       accounts: list,
       system_last_run: await this.store.getLastRunTime(),
       updated_at: fmtTime(Math.floor(Date.now() / 1000)),
