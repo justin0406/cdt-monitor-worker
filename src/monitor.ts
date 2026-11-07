@@ -23,6 +23,7 @@ const REGION_NAMES: Record<string, string> = {
   'cn-guangzhou': '华南3(广州)',
   'cn-chengdu': '西南1(成都)',
   'ap-northeast-1': '日本(东京)',
+  'ap-northeast-2': '韩国(首尔)',
 };
 
 const TRANSIENT_STATES = ['Starting', 'Stopping', 'Pending', 'Unknown'];
@@ -66,6 +67,7 @@ export class Monitor {
       const msg = String(e?.message || e);
       if (e?.Code) await this.store.addLog('error', `流量查询配置错误: ${e.Code}`);
       else if (/超时|timeout|abort/i.test(msg)) await this.store.addLog('error', '流量查询失败: 阿里云接口超时');
+      else if (/TrafficDetails/i.test(msg)) await this.store.addLog('error', '流量查询失败: CDT 返回空流量明细 (已重试)');
       else await this.store.addLog('error', '流量查询失败: 系统未知错误');
       return -1;
     }

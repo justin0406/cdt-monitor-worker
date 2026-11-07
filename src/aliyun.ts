@@ -29,6 +29,8 @@ export interface RpcRequest {
   regionId: string;
   query?: Record<string, string | number>;
   timeout?: number;
+  /** 返回错误文案 = 响应内容无效，按瞬态错误在退避循环内重试；返回 null = 有效（对齐上游 ad152f04） */
+  validate?: (json: any) => string | null;
 }
 
 /** URL 编码（阿里云要求：空格 %20，非 RFC3986 的 +） */
@@ -66,8 +68,8 @@ async function executeWithRetry<T>(
       lastErr = e;
       const code = String(e?.Code || e?.code || '');
       const isThrottling = /throttling/i.test(code);
-      // 4xx 且非流控：直接抛出（如 AccessKey 错误）
-      if (!isThrottling && (e?.statusCode >= 400 && e?.statusCode < 500)) {
+      // 4xx 且非流控：直接抛出（如 AccessKey 错误）；429 与流控同类，按瞬态重试（对齐上游 ad152f04）
+      if (!isThrottling && e?.statusCode !== 429 && (e?.statusCode >= 400 && e?.statusCode < 500)) {
         throw e;
       }
       if (attempt < maxRetries - 1) {
@@ -145,6 +147,9 @@ export class AliyunClient {
         err.statusCode = resp.status;
         throw err;
       }
+      // 响应体业务校验：失败视为瞬态错误，在同一个退避循环内重试（重试会重建签名参数）
+      const invalid = req.validate?.(json);
+      if (invalid) throw new Error(invalid);
       return json;
     });
   }
@@ -164,24 +169,33 @@ export class AliyunClient {
         action: 'ListCdtInternetTraffic',
         host: 'cdt.aliyuncs.com',
         regionId: 'cn-hongkong',
+        // CDT 偶发返回空 TrafficDetails（上游 ad152f04 确认为瞬态响应），
+        // 不能当作 0 GB 记账，否则面板与统计会被假 0 覆盖；重试后通常可恢复
+        validate: (json) =>
+          this.trafficDetails(json).length ? null : 'CDT 接口返回空 TrafficDetails (瞬态,已重试)',
       },
       account.access_key_id,
       account.access_key_secret,
     );
 
-    const details = result.TrafficDetails || [];
-    if (!details.length && !result.TrafficDetails) {
-      throw new Error('API 响应缺少 TrafficDetails 字段');
-    }
     const isTargetOverseas = this.isOverseas(account.region_id);
     let total = 0;
-    for (const d of details) {
+    for (const d of this.trafficDetails(result)) {
       const region = d.BusinessRegionId || '';
       if (this.isOverseas(region) === isTargetOverseas) {
         total += Number(d.Traffic || 0);
       }
     }
     return total / (1024 * 1024 * 1024);
+  }
+
+  /** CDT 流量明细：可能位于顶层 TrafficDetails 或 Data.TrafficDetails 下，
+   *  单条记录可能是对象而非数组（对齐上游 hasTrafficDetails 的兼容逻辑） */
+  private trafficDetails(result: any): any[] {
+    const norm = (v: any): any[] => (Array.isArray(v) ? v : v && typeof v === 'object' ? [v] : []);
+    const top = norm(result?.TrafficDetails);
+    if (top.length) return top;
+    return norm(result?.Data?.TrafficDetails);
   }
 
   /** 获取 ECS 实例状态 */
