@@ -68,8 +68,9 @@ export async function sendMail(
 
     // Workers 的 connect() 通过 secureTransport 声明加密方式：
     //   'on'       → 立即 TLS（465 / SMTPS）
-    //   'starttls' → 明文连接，运行时会在我方发出 STARTTLS 并收到 220 后自动升级为 TLS
-    // 注意：Socket 上没有 startTls() 方法，旧代码的 socket.startTls?.() 是空操作，587 端口实际发不出去。
+    //   'starttls' → 明文连接；运行时【不会】自动升级，必须在我方发出 STARTTLS
+    //                并收到 220 后显式调用 socket.startTls()，
+    //                升级返回一个新的 TLS Socket（旧 socket 随即被关闭），后续读写都要走新 socket。
     const options = useImplicitTls
       ? ({ secureTransport: 'on' } as any)
       : useStartTls
@@ -125,9 +126,10 @@ export async function sendMail(
     const ehlo = 'EHLO cdt-monitor\r\n';
     let resp = await talk(ehlo, [250]);
 
-    // STARTTLS：发命令 → 收 220 → 由运行时自动完成 TLS 升级 → 重新 EHLO
+    // STARTTLS：发命令 → 收 220 → 显式升级到 TLS（拿到新 socket）→ 在 TLS 上重新 EHLO
     if (useStartTls) {
       await talk('STARTTLS\r\n', [220]);
+      socket = await socket.startTls();
       resp = await talk(ehlo, [250]);
     }
     void resp;
